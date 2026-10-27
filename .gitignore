@@ -1,0 +1,27 @@
+# --- NVIDIA firmware blobs -------------------------------------------------
+# Extracted byte-for-byte from NVIDIA driver packages. NVIDIA copyright; never
+# redistributed with this repository. Regenerate locally per REPORT.md §10 step 4.
+Release/RTX3090-UNLOCK/ASSETS/*.bin
+Release/RTX3090-UNLOCK/ASSETS/NVIDIA-LICENSE
+
+# --- Per-machine configuration ---------------------------------------------
+# Contains this specific machine's partition GUIDs; generated locally, never shared.
+src/internal-boot/boot/platform-config.h
+src/internal-boot/boot/local-config.json
+src/internal-boot/unlock/profile-local.h
+
+# --- Build outputs ---------------------------------------------------------
+src/internal-boot/boot/build/
+src/internal-boot/unlock/build/
+*.obj
+*.map
+*.EFI
+*.efi
+!Release/EFI/Unlock/*.efi
+
+# --- Regenerable intermediates --------------------------------------------
+fw-inputs/
+gpu-unlock-fw/
+
+# --- Raw probe image dumps (large, machine-specific) ----------------------
+evidence/*.BIN
