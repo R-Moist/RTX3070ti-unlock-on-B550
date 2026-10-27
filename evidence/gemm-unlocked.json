@@ -1,0 +1,41 @@
+{
+  "device": "NVIDIA GeForce RTX 3070 Ti",
+  "torch": "2.14.1+cu126",
+  "results": {
+    "gemm_fp16_8192": {
+      "shape": "8192x8192x8192",
+      "ms": 12.77,
+      "tflops": 86.1,
+      "finite": true
+    },
+    "gemm_bf16_8192": {
+      "shape": "8192x8192x8192",
+      "ms": 12.815,
+      "tflops": 85.8,
+      "finite": true
+    },
+    "gemm_fp16_4096": {
+      "shape": "4096x4096x4096",
+      "ms": 1.627,
+      "tflops": 84.49,
+      "finite": true
+    },
+    "gemm_bf16_4096": {
+      "shape": "4096x4096x4096",
+      "ms": 1.619,
+      "tflops": 84.9,
+      "finite": true
+    },
+    "gemm_tf32_8192": {
+      "shape": "8192x8192x8192",
+      "ms": 47.368,
+      "tflops": 23.21,
+      "finite": true
+    },
+    "mem_copy_1gib": {
+      "size_gib": 1.0,
+      "ms": 2.0,
+      "gbps": 549.2
+    }
+  }
+}

@@ -1,0 +1,604 @@
+diff --git a/internal-boot/boot/build-diagnostic.ps1 b/internal-boot/boot/build-diagnostic.ps1
+index 84f0214..c10c70e 100644
+--- a/internal-boot/boot/build-diagnostic.ps1
++++ b/internal-boot/boot/build-diagnostic.ps1
+@@ -1,8 +1,12 @@
+ param([string]$Clang='clang',[string]$LldLink='lld-link',[string]$Python='python',
+- [ValidateSet('b650m-3090fe','b660m-3070ti','x870-3090ti','b660plus-3060','h610m-3060','probe-h610m-3060')][string]$HardwareProfile='b650m-3090fe',[switch]$UsbMedia,[switch]$DumpProm)
+-$profiles=@{'b650m-3090fe'=@();'b660m-3070ti'=@('-DGU_PROFILE_B660M_3070TI');'x870-3090ti'=@('-DGU_PROFILE_X870_3090TI');'b660plus-3060'=@('-DGU_PROFILE_B660PLUS_3060');'h610m-3060'=@('-DGU_PROFILE_H610M_3060');'probe-h610m-3060'=@('-DGU_PROFILE_PROBE_H610M_3060')}
++ [ValidateSet('b650m-3090fe','b660m-3070ti','x870-3090ti','b660plus-3060','h610m-3060','probe-h610m-3060','probe-b550m-3070ti')][string]$HardwareProfile='b650m-3090fe',[switch]$UsbMedia,[switch]$DumpProm)
++$profiles=@{'b650m-3090fe'=@();'b660m-3070ti'=@('-DGU_PROFILE_B660M_3070TI');'x870-3090ti'=@('-DGU_PROFILE_X870_3090TI');'b660plus-3060'=@('-DGU_PROFILE_B660PLUS_3060');'h610m-3060'=@('-DGU_PROFILE_H610M_3060');'probe-h610m-3060'=@('-DGU_PROFILE_PROBE_H610M_3060');'probe-b550m-3070ti'=@('-DGU_PROFILE_PROBE_B550M_3070TI')}
+ $defines=@($profiles[$HardwareProfile]);if($UsbMedia){$defines+='-DGU_USB_MEDIA'}
+ if($DumpProm){if(!$UsbMedia){throw '-DumpProm writes the PROM to the observation stick; it requires -UsbMedia'};$defines+='-DGU_PROBE_DUMP_PROM'}
++# probe.c compiles the PROM writer for these profiles regardless of -DumpProm, so the
++# manifest must report the capability the binary actually has, not just the switch state.
++$promProfiles=@('h610m-3060','probe-h610m-3060','probe-b550m-3070ti')
++$dumpsProm=$DumpProm -or ($promProfiles -contains $HardwareProfile)
+ $ErrorActionPreference='Stop'
+ $HardwareProfile=$HardwareProfile.ToLowerInvariant()
+ $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+@@ -34,7 +38,7 @@ try {
+   Format=1
+   HardwareTested=$false;Mode='graph-capture-then-normal-windows';CanUnlock=$false
+   CanDetach=$false;WritesFirmwareVariables=$false
+-  HardwareProfile=$HardwareProfile;UsbMedia=[bool]$UsbMedia;DumpsProm=[bool]$DumpProm;Defines=$defines
++  HardwareProfile=$HardwareProfile;UsbMedia=[bool]$UsbMedia;DumpsProm=[bool]$dumpsProm;Defines=$defines
+   EfiSha256=(Get-FileHash -LiteralPath build/diagnostic/DIAGNOSTIC.EFI -Algorithm SHA256).Hash.ToLowerInvariant()
+   BuiltUtc=[DateTime]::UtcNow.ToString('o');Sources=$sourceManifest
+  }
+diff --git a/internal-boot/boot/diagnostic.c b/internal-boot/boot/diagnostic.c
+index 548f1b4..fd90455 100644
+--- a/internal-boot/boot/diagnostic.c
++++ b/internal-boot/boot/diagnostic.c
+@@ -141,9 +141,11 @@ static VOID Details(CAPTURE *c,EFI_HANDLE h,EFI_GUID *g) {
+       Field(c," height=0x",gp->Mode->Info->VerticalResolution);
+       Field(c," stride=0x",gp->Mode->Info->PixelsPerScanLine);End(c);
+     } else {
+-#if GU_CONSOLE_AGGREGATE || defined(GU_PROBE_GENERIC)
++#if GU_CONSOLE_AGGREGATE || defined(GU_PROBE_GENERIC) || defined(GU_PROFILE_PROBE_B550M_3070TI)
+       /* Aggregate/pathless GOPs legitimately lack Mode->Info on this firmware;
+-         record it as an observation, not a capture failure (generic probe: topology unknown). */
++         record it as an observation, not a capture failure (generic probe: topology unknown).
++         The B550M/3070 Ti probe identity does not know its console class yet, so the
++         absence of Mode->Info must also be an observation here, not a failure. */
+       Field(c,"gop info-bytes=0x",gp->Mode->SizeOfInfo);End(c);
+ #else
+       Problem(c,"gop-info",EFI_NOT_READY);
+diff --git a/internal-boot/boot/media.h b/internal-boot/boot/media.h
+index d539ad0..eb56cf4 100644
+--- a/internal-boot/boot/media.h
++++ b/internal-boot/boot/media.h
+@@ -43,6 +43,29 @@ static inline BOOLEAN GuPathIsPartition(const EFI_DEVICE_PATH_PROTOCOL *Path,con
+   return GuInspectPath(Path,Guid,NULL,NULL,&match) && match;
+ }
+ 
++/* Location-independent acceptance: any well-formed path carrying exactly one
++ * GPT/MBR HARDDRIVE node, i.e. a real disk partition, with no specific GUID.
++ * Used where the image may legitimately live on the internal ESP, a USB stick,
++ * or a folder invoked from the UEFI Shell. Malformed, repeated or absent HD
++ * nodes are still refused. */
++static inline BOOLEAN GuPathIsHardDrive(const EFI_DEVICE_PATH_PROTOCOL *Path) {
++  UINTN total=0,hd=0;
++  if(!Path)return FALSE;
++  for(UINTN nodes=0;nodes<64 && total+4<=4096;nodes++) {
++    UINTN n=Path->Length[0]+((UINTN)Path->Length[1]<<8);
++    if(n<4 || n>4096-total)return FALSE;
++    if(Path->Type==END_DEVICE_PATH_TYPE) {
++      if(n!=4 || Path->SubType!=END_ENTIRE_DEVICE_PATH_SUBTYPE)return FALSE;
++      return hd==1;
++    }
++    if(Path->Type==MEDIA_DEVICE_PATH && Path->SubType==MEDIA_HARDDRIVE_DP) {
++      if(n!=sizeof(HARDDRIVE_DEVICE_PATH) || ++hd!=1)return FALSE;
++    }
++    total+=n;Path=(const VOID *)((const UINT8 *)Path+n);
++  }
++  return FALSE;
++}
++
+ static inline BOOLEAN GuAllowedMediaPath(const EFI_DEVICE_PATH_PROTOCOL *Path,BOOLEAN InternalAllowed) {
+   BOOLEAN usb=FALSE,partition=FALSE;
+   return GuInspectPath(Path,&GuInternalPartition,NULL,&usb,&partition) && (usb || (InternalAllowed && partition));
+diff --git a/internal-boot/boot/probe.c b/internal-boot/boot/probe.c
+index 86c4730..d576370 100644
+--- a/internal-boot/boot/probe.c
++++ b/internal-boot/boot/probe.c
+@@ -15,10 +15,10 @@
+ #if defined(GU_PROBE_DUMP_PROM) && (!defined(GU_DIAGNOSTIC_ONLY) || !defined(GU_DIAGNOSTIC_PROBE) || !defined(GU_USB_MEDIA) || defined(GU_FULL_UNLOCK) || defined(GU_EXPERIMENTAL_3090))
+ #error GU_PROBE_DUMP_PROM is only for the observation-only diagnostic image
+ #endif
+-#if defined(GU_PROBE_GENERIC) || defined(GU_PROBE_DUMP_PROM) || defined(GU_PROFILE_H610M_3060) || defined(GU_PROFILE_PROBE_H610M_3060) || (defined(GU_DIAGNOSTIC_ONLY) && defined(GU_USB_MEDIA))
++#if defined(GU_PROBE_GENERIC) || defined(GU_PROBE_DUMP_PROM) || defined(GU_PROFILE_H610M_3060) || defined(GU_PROFILE_PROBE_H610M_3060) || defined(GU_PROFILE_PROBE_B550M_3070TI) || (defined(GU_DIAGNOSTIC_ONLY) && defined(GU_USB_MEDIA))
+ #define GU_CHECKED_PROBE 1
+ #endif
+-#if defined(GU_PROBE_DUMP_PROM) || defined(GU_PROFILE_H610M_3060) || defined(GU_PROFILE_PROBE_H610M_3060) || (defined(GU_DIAGNOSTIC_ONLY) && defined(GU_USB_MEDIA))
++#if defined(GU_PROBE_DUMP_PROM) || defined(GU_PROFILE_H610M_3060) || defined(GU_PROFILE_PROBE_H610M_3060) || defined(GU_PROFILE_PROBE_B550M_3070TI) || (defined(GU_DIAGNOSTIC_ONLY) && defined(GU_USB_MEDIA))
+ #define GU_PROBE_PRESERVE_CAPTURE 1
+ #endif
+ 
+@@ -155,14 +155,47 @@ static BOOLEAN ProbeEnvelope(CAPTURE *c,EFI_PCI_IO_PROTOCOL *io,const UINT32 *cf
+   if(cfg[4]!=(UINT32)GU_BAR0_BASE)identity=FALSE;
+ #endif
+ #endif
+-  if(!identity || cfg[2]!=0x030000a1U ||
+-     (cfg[1]&6U)!=2U || !cfg[4] || (cfg[4]&0xffffffU) || !io->GetBarAttributes || !io->Mem.Read)return FALSE;
++  BOOLEAN basic=identity && cfg[2]==0x030000a1U && (cfg[1]&6U)==2U && cfg[4] && !(cfg[4]&0xffffffU) &&
++                io->GetBarAttributes && io->Mem.Read;
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++  /* Probe-only identity. This build cannot arm, release a driver, enable bus
++   * mastering, allocate DMA or issue FLR, and it only performs read-only MMIO
++   * plus a file write, so the reviewed envelope is RECORDED here rather than
++   * enforced. Every reviewed condition is still evaluated and logged, so the
++   * delta against the reviewed profiles shows up in DIAG instead of hiding. */
++  Text(c,"envelope identity=");Hex(c,identity?1:0,1);
++  Text(c," basic=");Hex(c,basic?1:0,1);
++  Text(c," cfg2=0x");Hex(c,cfg[2],8);
++  Text(c," cmd=0x");Hex(c,cfg[1],8);
++  Text(c," bar0=0x");Hex(c,cfg[4],8);End(c);
++#endif
++  if(!basic) {
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++    Text(c,"envelope reviewed-result=0 reason=basic (recorded, not enforced)");End(c);
++    return TRUE;
++#else
++    return FALSE;
++#endif
++  }
+   VOID *raw=NULL;
+   EFI_STATUS s=io->GetBarAttributes(io,0,NULL,&raw);
+   BOOLEAN good=FALSE;
+   if(s==EFI_SUCCESS && raw) {
+     const EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR *d=raw;
+     const UINT8 *end=(const UINT8 *)(d+1);
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++    Text(c,"envelope desc status=0x");Hex(c,s,16);
++    Text(c," desc=0x");Hex(c,d->Desc,2);
++    Text(c," len=0x");Hex(c,d->Len,2);
++    Text(c," restype=0x");Hex(c,d->ResType,2);
++    Text(c," gran=0x");Hex(c,d->AddrSpaceGranularity,2);End(c);
++    Text(c,"envelope desc min=0x");Hex(c,d->AddrRangeMin,16);
++    Text(c," max=0x");Hex(c,d->AddrRangeMax,16);
++    Text(c," len=0x");Hex(c,d->AddrLen,16);
++    Text(c," xlate=0x");Hex(c,d->AddrTranslationOffset,16);
++    Text(c," end=0x");Hex(c,end[0],2);
++    Text(c," sum=0x");Hex(c,end[1],2);End(c);
++#endif
+     good=d->Desc==ACPI_ADDRESS_SPACE_DESCRIPTOR && d->Len==sizeof(*d)-3 && !d->ResType &&
+       d->AddrSpaceGranularity==32 && d->AddrRangeMin==cfg[4] && d->AddrLen==0x1000000 &&
+       !d->AddrTranslationOffset && (d->AddrRangeMax==(UINT64)cfg[4]+0xffffff || d->AddrRangeMax==0xffffff) &&
+@@ -173,13 +206,30 @@ static BOOLEAN ProbeEnvelope(CAPTURE *c,EFI_PCI_IO_PROTOCOL *io,const UINT32 *cf
+     }
+   }
+   if(raw && c->Table->BootServices->FreePool(raw)!=EFI_SUCCESS)good=FALSE;
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++  Text(c,"envelope reviewed-result=");Hex(c,good?1:0,1);
++  Text(c," (recorded, not enforced)");End(c);
++  return TRUE;
++#else
+   return good;
++#endif
+ }
+ static BOOLEAN ProbeUnchanged(CAPTURE *c,EFI_HANDLE handle,EFI_PCI_IO_PROTOCOL *io,const UINT32 *cfg) {
+   EFI_PCI_IO_PROTOCOL *current=NULL;UINTN seg=0,bus=0,dev=0,fun=0;UINT32 now[64];
+   if(c->Table->BootServices->HandleProtocol(handle,&PciGuidL,(VOID **)&current)!=EFI_SUCCESS || current!=io ||
+-     !io->GetLocation || io->GetLocation(io,&seg,&bus,&dev,&fun)!=EFI_SUCCESS || seg || bus!=1 || dev || fun ||
++     !io->GetLocation || io->GetLocation(io,&seg,&bus,&dev,&fun)!=EFI_SUCCESS ||
+      io->Pci.Read(io,EfiPciIoWidthUint32,0,64,now)!=EFI_SUCCESS)return FALSE;
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++  /* This board's target is behind 00:03.1 on bus 0x07, not the reviewed
++   * 0000:01:00.0. The identical-config-dword comparison below is the
++   * load-bearing check; the location is recorded rather than pinned. */
++  Text(c,"probe-location seg=0x");Hex(c,seg,4);
++  Text(c," bus=0x");Hex(c,bus,4);
++  Text(c," dev=0x");Hex(c,dev,4);
++  Text(c," fun=0x");Hex(c,fun,4);End(c);
++#else
++  if(seg || bus!=1 || dev || fun)return FALSE;
++#endif
+   for(UINTN j=0;j<64;j++)if(now[j]!=cfg[j])return FALSE;
+   return TRUE;
+ }
+diff --git a/internal-boot/unlock/app.c b/internal-boot/unlock/app.c
+index aef52c2..4405740 100644
+--- a/internal-boot/unlock/app.c
++++ b/internal-boot/unlock/app.c
+@@ -39,7 +39,7 @@ static VOID ConfigLog(const UINT32 *Config) {
+   for(UINTN i=0;i<64;i+=4)GuLog("config[%02x]=%08x %08x %08x %08x\n",
+     (unsigned)(i*4),Config[i],Config[i+1],Config[i+2],Config[i+3]);
+ }
+-#ifndef GU_HEADLESS_RESEARCH
++#if !defined(GU_HEADLESS_RESEARCH) && !defined(GU_PROFILE_B550M_3070TI)
+ static VOID GopInfoLog(UINTN Index,const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info) {
+   GuLog("GOP[%u] format=%u size=%ux%u stride=%u\n",(unsigned)Index,
+     (unsigned)Info->PixelFormat,Info->HorizontalResolution,Info->VerticalResolution,Info->PixelsPerScanLine);
+@@ -87,9 +87,79 @@ static BOOLEAN AmdGopParent(EFI_DEVICE_PATH_PROTOCOL *Path) {
+   return !EFI_ERROR(status) && id==GU_AMD_ID && subsystem==GU_AMD_SUBSYSTEM;
+ }
+ #endif
++#if defined(GU_PROFILE_B550M_3070TI)
++/* This board has no integrated display controller at all: the target RTX owns
++ * the only GOP and is also where ConOutDev points. The reviewed model (console
++ * on a separate AMD iGPU, which survives releasing the NVIDIA GOP) is
++ * unsatisfiable here, so the property is inverted rather than dropped:
++ *   - exactly one GOP exists,
++ *   - that GOP belongs to the target endpoint (segment/bus/device/function),
++ *   - its mode is a usable RGB/BGR framebuffer,
++ * and the loss of the console during release is logged explicitly. Screen goes
++ * dark until Windows reinitialises the card, which is the documented behaviour
++ * of the manual route and the reason the U prompt comes first. */
++static BOOLEAN TargetOwnsConsole(VOID) {
++  EFI_HANDLE *handles=NULL;UINTN count=0;BOOLEAN ok=FALSE;
++  EFI_STATUS status=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&count,&handles);
++  GuLog("GOP enumeration (target-console profile): status=%#llx handles=%zu armed=%u\n",
++    (unsigned long long)status,(size_t)count,(unsigned)Gu.armed);
++  if(Gu.armed) {
++    /* Post-release: this driver installs the only GOP, so releasing it must
++       leave zero graphics output handles. This is the documented headless
++       outcome ("one RTX physical GOP before release, zero afterward") and the
++       reason the screen stays dark until Windows loads its own driver. */
++    if(count==0 && (status==EFI_SUCCESS || status==EFI_NOT_FOUND)) {
++      ok=TRUE;
++      GuLogText("post-release: no GOP remains, console detach is complete\n");
++    } else {
++      GuLog("post-release: expected zero GOPs, observed %zu (status=%#llx)\n",
++        (size_t)count,(unsigned long long)status);
++    }
++    goto done;
++  }
++  if(EFI_ERROR(status) || !handles || count!=1)goto done;
++  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;
++  status=Gu.bs->HandleProtocol(handles[0],&GopGuid,(VOID **)&gop);
++  if(EFI_ERROR(status) || !gop || !gop->Mode)goto done;
++  status=Gu.bs->HandleProtocol(handles[0],&PathGuid,(VOID **)&path);
++  if(EFI_ERROR(status) || !path)goto done;
++  EFI_DEVICE_PATH_PROTOCOL *remaining=path;EFI_HANDLE parent=NULL;
++  if(!Gu.bs->LocateDevicePath)goto done;
++  status=Gu.bs->LocateDevicePath(&PciGuid,&remaining,&parent);
++  if(EFI_ERROR(status) || !parent)goto done;
++  EFI_PCI_IO_PROTOCOL *pci=NULL;UINTN seg=0,bus=0,dev=0,fun=0;
++  status=Gu.bs->HandleProtocol(parent,&PciGuid,(VOID **)&pci);
++  if(EFI_ERROR(status) || !pci || !pci->GetLocation)goto done;
++  status=pci->GetLocation(pci,&seg,&bus,&dev,&fun);
++  if(EFI_ERROR(status))goto done;
++  GuLog("GOP[0] parent seg=%zu bus=%zu dev=%zu fun=%zu expected 0/%u/0/0\n",
++    (size_t)seg,(size_t)bus,(size_t)dev,(size_t)fun,(unsigned)GU_TARGET_BUS);
++  if(seg!=0 || bus!=GU_TARGET_BUS || dev!=0 || fun!=0)goto done;
++  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode=gop->Mode;
++  GuLog("GOP[0] framebuffer=%#llx bytes=%zu mode=%u max_mode=%u info_bytes=%zu console=%u\n",
++    (unsigned long long)mode->FrameBufferBase,(size_t)mode->FrameBufferSize,
++    mode->Mode,mode->MaxMode,(size_t)mode->SizeOfInfo,(unsigned)(handles[0]==Table->ConsoleOutHandle));
++  if(!mode->FrameBufferBase || !mode->FrameBufferSize || !mode->Info ||
++     mode->SizeOfInfo<sizeof(*mode->Info))goto done;
++  const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info=mode->Info;
++  GuLog("GOP[0] format=%u %ux%u stride=%u\n",(unsigned)info->PixelFormat,
++    info->HorizontalResolution,info->VerticalResolution,info->PixelsPerScanLine);
++  if(info->PixelFormat>PixelBlueGreenRedReserved8BitPerColor ||
++     !info->HorizontalResolution || !info->VerticalResolution ||
++     info->PixelsPerScanLine<info->HorizontalResolution ||
++     (UINT64)info->PixelsPerScanLine*info->VerticalResolution>mode->FrameBufferSize/4)goto done;
++  ok=TRUE;
++  GuLogText("target-console topology accepted: console is ON the target, so it WILL be lost during release and is expected back once Windows loads the driver\n");
++done:
++  if(handles)GuFree(handles);
++  return ok && GuLogReady();
++}
++#endif
+ static BOOLEAN DisplayCheck(VOID) {
+ #ifdef GU_HEADLESS_RESEARCH
+   return GuHeadlessCheck() && GuLogReady();
++#elif defined(GU_PROFILE_B550M_3070TI)
++  return TargetOwnsConsole();
+ #else
+   EFI_HANDLE *handles=NULL;UINTN count=0,intel=0;BOOLEAN valid=TRUE;
+   EFI_GRAPHICS_OUTPUT_MODE_INFORMATION physical={0},forwarded={0};BOOLEAN forwarding=FALSE;
+@@ -412,6 +482,64 @@ static VOID ReleaseHalt(EFI_STATUS Status,BOOLEAN Attempted) {
+     (unsigned long long)Status,Stage,Attempted,(unsigned long long)contained,(unsigned)(Gu.pci!=NULL));
+   Halt();
+ }
++#if defined(GU_PROFILE_B550M_3070TI)
++#include "../boot/media.h"
++#include <Protocol/SimpleFileSystem.h>
++/* After the transaction the target's console driver is gone. Returning to the
++ * firmware makes BDS redraw its UI with zero graphics output, which hangs on
++ * this firmware generation and loses the volatile SS0 write on the power cycle.
++ * Chain-load Windows Boot Manager from the configured Windows ESP instead, so
++ * the unlocked GPU state reaches the Windows driver with no reset in between. */
++static EFI_STATUS WindowsHandoff(VOID) {
++  EFI_GUID fsGuid=EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
++  EFI_HANDLE *handles=NULL;UINTN count=0,matches=0;EFI_HANDLE win=NULL;
++  BOOLEAN pinned=FALSE;
++  EFI_STATUS s=Gu.bs->LocateHandleBuffer(ByProtocol,&fsGuid,NULL,&count,&handles);
++  if(EFI_ERROR(s) || !handles)return s;
++  /* Discover by file presence, not by pinned partition GUID: a Windows
++   * reinstall or a rebuilt EFI System Partition keeps working, and the same
++   * image stays usable from any disk or Shell location. */
++  for(UINTN i=0;i<count;i++) {
++    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs=NULL;
++    EFI_FILE_PROTOCOL *root=NULL,*file=NULL;
++    if(EFI_ERROR(Gu.bs->HandleProtocol(handles[i],&fsGuid,(VOID **)&fs)) || !fs)continue;
++    if(EFI_ERROR(fs->OpenVolume(fs,&root)) || !root)continue;
++    EFI_STATUS has=root->Open(root,&file,L"\\EFI\\Microsoft\\Boot\\bootmgfw.efi",EFI_FILE_MODE_READ,0);
++    if(file)file->Close(file);
++    root->Close(root);
++    if(EFI_ERROR(has))continue;
++    matches++;win=handles[i];
++    EFI_DEVICE_PATH_PROTOCOL *p=NULL;
++    if(!EFI_ERROR(Gu.bs->HandleProtocol(handles[i],&PathGuid,(VOID **)&p)) && p)
++      pinned=GuPathIsPartition(p,&GuWindowsPartition);
++  }
++  GuLog("windows handoff: candidates=%zu configured_guid_match=%u\n",(size_t)matches,(unsigned)pinned);
++  if(matches!=1){GuFree(handles);return matches?EFI_COMPROMISED_DATA:EFI_NOT_FOUND;}
++  EFI_DEVICE_PATH_PROTOCOL *base=NULL;UINTN baseBytes=0;
++  if(EFI_ERROR(Gu.bs->HandleProtocol(win,&PathGuid,(VOID **)&base)) || !base){GuFree(handles);return EFI_UNSUPPORTED;}
++  if(!GuInspectPath(base,NULL,&baseBytes,NULL,NULL) || baseBytes<4){GuFree(handles);return EFI_UNSUPPORTED;}
++  GuFree(handles);handles=NULL;
++  static const CHAR16 name[]=L"\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
++  UINTN chars=0;while(name[chars])chars++;
++  UINTN nodeBytes=4+(chars+1)*sizeof(CHAR16);
++  UINTN total=baseBytes-4+nodeBytes+4;
++  UINT8 *data=NULL;
++  s=Gu.bs->AllocatePool(EfiBootServicesData,total,(VOID **)&data);
++  if(EFI_ERROR(s) || !data)return EFI_OUT_OF_RESOURCES;
++  for(UINTN i=0;i<baseBytes-4;i++)data[i]=((UINT8 *)base)[i];
++  EFI_DEVICE_PATH_PROTOCOL *node=(VOID *)(data+baseBytes-4);
++  node->Type=MEDIA_DEVICE_PATH;node->SubType=MEDIA_FILEPATH_DP;
++  node->Length[0]=(UINT8)nodeBytes;node->Length[1]=(UINT8)(nodeBytes>>8);
++  for(UINTN i=0;i<(chars+1)*sizeof(CHAR16);i++)((UINT8 *)node)[4+i]=((const UINT8 *)name)[i];
++  EFI_DEVICE_PATH_PROTOCOL *end=(VOID *)((UINT8 *)node+nodeBytes);
++  end->Type=END_DEVICE_PATH_TYPE;end->SubType=END_ENTIRE_DEVICE_PATH_SUBTYPE;end->Length[0]=4;end->Length[1]=0;
++  EFI_HANDLE image=NULL;
++  s=Gu.bs->LoadImage(FALSE,Gu.image,(EFI_DEVICE_PATH_PROTOCOL *)data,NULL,0,&image);
++  GuFree(data);
++  if(EFI_ERROR(s) || !image)return s;
++  return Gu.bs->StartImage(image,NULL,NULL);
++}
++#endif
+ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+   if(!St || !St->BootServices || !St->RuntimeServices)return EFI_INVALID_PARAMETER;
+   Table=St;GuInit(St->BootServices,NULL);Gu.image=Image;Gu.display_check=DisplayCheck;
+@@ -511,6 +639,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+   if(EFI_ERROR(contained) || !GuSafeToReturn() || Gu.allocations || (Gu.started && result))Halt();
+   gpu_unlock_610_release_shared(&shared);Gu.armed=FALSE;
+   status=result?EFI_DEVICE_ERROR:EFI_SUCCESS;
++#if defined(GU_PROFILE_B550M_3070TI)
++  if(!EFI_ERROR(status)) {
++    GuLogText("transaction complete; chain-loading Windows Boot Manager with no reset\n");
++    (void)GuIoClose();
++    EFI_STATUS handoff=WindowsHandoff();
++    /* StartImage returned, so the console is still detached and BDS must never
++       redraw. Stop here; the operator powers off and reboots normally. */
++    if(!EFI_ERROR(handoff))Halt();
++  }
++#endif
+  finish:
+   if(release_attempted && (EFI_ERROR(status) || Gu.fault))ReleaseHalt(status,attempted);
+   if(attempted && !GuSafeToReturn())Halt();
+diff --git a/internal-boot/unlock/app_io.c b/internal-boot/unlock/app_io.c
+index a079ac5..fc94cfa 100644
+--- a/internal-boot/unlock/app_io.c
++++ b/internal-boot/unlock/app_io.c
+@@ -5,7 +5,7 @@
+ #include <Protocol/LoadedImage.h>
+ #include <Protocol/SimpleFileSystem.h>
+ #include <Guid/FileInfo.h>
+-#if defined(GU_INTERNAL_BOOT)
++#if defined(GU_INTERNAL_BOOT) || defined(GU_PROFILE_B550M_3070TI)
+ #include "../boot/media.h"
+ #endif
+ static EFI_GUID LoadedGuid=EFI_LOADED_IMAGE_PROTOCOL_GUID,PathGuid=EFI_DEVICE_PATH_PROTOCOL_GUID,
+@@ -63,6 +63,12 @@ static BOOLEAN UsbPath(EFI_HANDLE Handle) {
+   return GuPathIsPartition(path,&GuInternalPartition);
+ #elif defined(GU_INTERNAL_BOOT) && !defined(GU_USB_MEDIA)
+   return GuAllowedMediaPath(path,TRUE);
++#elif defined(GU_PROFILE_B550M_3070TI) && !defined(GU_USB_MEDIA)
++  /* Location independent: accept whatever real disk partition the image was
++   * loaded from, so the same binary runs from the internal ESP, any USB stick,
++   * or a folder invoked from the UEFI Shell. The GPT/MBR HARDDRIVE node is
++   * still required, so virtual/block devices and bare paths are refused. */
++  return GuPathIsHardDrive(path);
+ #else
+   UINTN total=0;BOOLEAN usb=FALSE;
+   for(UINTN nodes=0;nodes<64 && total+4<=4096;nodes++) {
+@@ -97,7 +103,23 @@ EFI_STATUS GuIoOpen(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+ #else
+   status=Root->Open(Root,&Parent,L"\\RTX3090-PREFLIGHT",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
+ #endif
+-  if(EFI_ERROR(status) || !Parent)return EFI_NOT_FOUND;
++#if defined(GU_PROFILE_B550M_3070TI)
++  /* Shell/anywhere operation: if the volume has no output directory yet, create
++   * it rather than exiting silently. Without this a fresh stick or a Shell
++   * invocation fails before a single log line exists, which is indistinguishable
++   * from "the firmware never loaded the image". */
++  if(EFI_ERROR(status) || !Parent) {
++    Parent=NULL;
++#if defined(GU_EXPERIMENTAL_3090)
++    status=Root->Open(Root,&Parent,L"\\RTX3090-UNLOCK",
++      EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE,0);
++#else
++    status=Root->Open(Root,&Parent,L"\\RTX3090-PREFLIGHT",
++      EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE,0);
++#endif
++  }
++#endif
++  if(EFI_ERROR(status) || !Parent){Parent=NULL;return EFI_NOT_FOUND;}
+   status=Metadata(Parent,TRUE,0);if(EFI_ERROR(status))return status;
+ #ifdef GU_AUTOMATIC_BOOT
+   for(UINTN slot=0;slot<1000000;slot++) {
+diff --git a/internal-boot/unlock/build.ps1 b/internal-boot/unlock/build.ps1
+index e5847eb..4b93877 100644
+--- a/internal-boot/unlock/build.ps1
++++ b/internal-boot/unlock/build.ps1
+@@ -9,7 +9,7 @@ param(
+  [switch]$HeadlessResearch,
+  [switch]$UsbMedia,
+  [ValidateSet('original03100062','observed03000062','entryLatchedSs1Preserve','entryLatchedSs1Full')][string]$StockProfile,
+- [ValidateSet('b650m-3090fe','b660m-3070ti','x870-3090ti','b660plus-3060','h610m-3060','local')][string]$HardwareProfile='b650m-3090fe'
++ [ValidateSet('b650m-3090fe','b660m-3070ti','x870-3090ti','b660plus-3060','h610m-3060','b550m-3070ti','local')][string]$HardwareProfile='b650m-3090fe'
+ )
+ # Reviewed single-machine profiles; mirrors internal-boot/unlock/machine-profile.h.
+ # A profile is fixed provenance: it selects constants compiled into the EFI,
+@@ -21,6 +21,7 @@ $hwTable=@{
+  'h610m-3060'=[ordered]@{Define='-DGU_PROFILE_H610M_3060';Name='GIGABYTE-H610M-H-FC-RTX3060-12GB';TargetPci='250410de';Subsystem='40961458';Chip='0xb76000a1';Prom='727dd8332f028783d3de2f81a707e4d9448c3238db6180271f3a8e9c03a808c9';Memory='0x3000';HeadlessOnly=$true;UsbOnly=$true}
+  'x870-3090ti'=[ordered]@{Define='-DGU_PROFILE_X870_3090TI';Name='GIGABYTE-X870-AORUS-ELITE-WIFI7-F13d-RTX3090TI';TargetPci='220310de';Subsystem='88701043';Chip='0xb72000a1';Prom='943565975885ee71a7e861265984c785f564f35272c32395ee7410b353d9bbc4';Memory='0x5ff4';HeadlessOnly=$true}
+  'b660plus-3060'=[ordered]@{Define='-DGU_PROFILE_B660PLUS_3060';Name='ASUS-PRIME-B660-PLUS-D4-3010-RTX3060';TargetPci='248710de';Subsystem='153010de';Chip='0xb74000a1';Prom='7cc9018e80c63e4aec79c71cd4ed6bdeb5e147aeeb22b21b96efe90887ba8806';Memory='0x3000';HeadlessOnly=$true;UsbOnly=$true}
++ 'b550m-3070ti'=[ordered]@{Define='-DGU_PROFILE_B550M_3070TI';Name='ASUS-TUF-GAMING-B550M-PLUS-WIFI-3636-RTX3070TI';TargetPci='248210de';Subsystem='16217377';Chip='0xb74000a1';Prom='85c502fd09d140bb9cba1f6fb541da838929f61039a9bc9f036b4d33612e6eb3';Memory='0x2000';HeadlessOnly=$false}
+ }
+ $ErrorActionPreference='Stop'
+ . (Join-Path $PSScriptRoot 'local-profile.ps1')
+diff --git a/internal-boot/unlock/checks.c b/internal-boot/unlock/checks.c
+index a2fdd31..9360d80 100644
+--- a/internal-boot/unlock/checks.c
++++ b/internal-boot/unlock/checks.c
+@@ -26,7 +26,7 @@ BOOLEAN GuCheckConfig(const UINT32 Config[64], UINTN Segment, UINTN Bus,
+ 
+   if (Out == NULL) return FALSE;
+   *Out = Caps;
+-  if (Config == NULL || Segment != 0 || Bus != 1 || Device != 0 || Function != 0)
++  if (Config == NULL || Segment != 0 || Bus != GU_TARGET_BUS || Device != 0 || Function != 0)
+     return FALSE;
+   if (Config[0] != GU_BOARD_ID || Config[0x2c / 4] != GU_BOARD_SUBSYSTEM ||
+       ConfigByte(Config, 0x0b) != PCI_CLASS_DISPLAY ||
+diff --git a/internal-boot/unlock/machine-profile.h b/internal-boot/unlock/machine-profile.h
+index 25ff441..07e5807 100644
+--- a/internal-boot/unlock/machine-profile.h
++++ b/internal-boot/unlock/machine-profile.h
+@@ -10,10 +10,10 @@
+  */
+ #pragma once
+ 
+-#if (defined(GU_PROFILE_B650M_3090FE) + defined(GU_PROFILE_B660M_3070TI) + defined(GU_PROFILE_X870_3090TI) + defined(GU_PROFILE_B660PLUS_3060) + defined(GU_PROFILE_LOCAL) + defined(GU_PROFILE_H610M_3060) + defined(GU_PROFILE_PROBE_H610M_3060)) > 1
++#if (defined(GU_PROFILE_B650M_3090FE) + defined(GU_PROFILE_B660M_3070TI) + defined(GU_PROFILE_X870_3090TI) + defined(GU_PROFILE_B660PLUS_3060) + defined(GU_PROFILE_LOCAL) + defined(GU_PROFILE_H610M_3060) + defined(GU_PROFILE_PROBE_H610M_3060) + defined(GU_PROFILE_PROBE_B550M_3070TI) + defined(GU_PROFILE_B550M_3070TI)) > 1
+ #error Select exactly one machine profile
+ #endif
+-#if !defined(GU_PROFILE_B650M_3090FE) && !defined(GU_PROFILE_B660M_3070TI) && !defined(GU_PROFILE_X870_3090TI) && !defined(GU_PROFILE_B660PLUS_3060) && !defined(GU_PROFILE_LOCAL) && !defined(GU_PROFILE_H610M_3060) && !defined(GU_PROFILE_PROBE_H610M_3060)
++#if !defined(GU_PROFILE_B650M_3090FE) && !defined(GU_PROFILE_B660M_3070TI) && !defined(GU_PROFILE_X870_3090TI) && !defined(GU_PROFILE_B660PLUS_3060) && !defined(GU_PROFILE_LOCAL) && !defined(GU_PROFILE_H610M_3060) && !defined(GU_PROFILE_PROBE_H610M_3060) && !defined(GU_PROFILE_PROBE_B550M_3070TI) && !defined(GU_PROFILE_B550M_3070TI)
+ #define GU_PROFILE_B650M_3090FE 1
+ #endif
+ 
+@@ -28,6 +28,14 @@
+ #error GU_PROFILE_PROBE_H610M_3060 must not be combined with release or unlock builds
+ #endif
+ #endif
++#if defined(GU_PROFILE_PROBE_B550M_3070TI)
++#if !defined(GU_DIAGNOSTIC_PROBE) || (!defined(GU_DIAGNOSTIC_ONLY) && !defined(GU_PROBE_HOST_TEST))
++#error GU_PROFILE_PROBE_B550M_3070TI is for the read-only diagnostic probe only
++#endif
++#if defined(GU_FULL_UNLOCK) || defined(GU_EXPERIMENTAL_3090) || defined(GU_UEFI_PORT) || defined(GU_INTERNAL_BOOT) || defined(GU_CONSOLE_PREPARE) || defined(GU_AUTOMATIC_BOOT) || defined(GU_HEADLESS_RESEARCH)
++#error GU_PROFILE_PROBE_B550M_3070TI must not be combined with release or unlock builds
++#endif
++#endif
+ 
+ /* 1 = the AMI combo splitter owns the console on top of the target GPU
+  * (aggregate GOP + text-out driver chain; verified on AMI boards without a
+@@ -73,6 +81,19 @@
+ #define GU_BOARD_ID 0x250410deU
+ #define GU_BOARD_SUBSYSTEM 0x40961458U
+ 
++#elif defined(GU_PROFILE_PROBE_B550M_3070TI)
++
++/* ASUSTeK TUF GAMING B550M-PLUS (WI-FI) BIOS 3636, Ryzen 9 5900X (no
++ * integrated display controller at all), Colorful RTX 3070 Ti 8GB (GA104,
++ * VBIOS 94.04.5a.00.bb): UNREVIEWED, probe only. Only the PCI identity is
++ * known from Windows; BAR0, VRAM size, chip ID, PROM hash, root port,
++ * display paths, console/combo/EDID/nvgop fingerprints and the aggregate
++ * vs direct nvgop console class are what the probe collects.
++ * Deliberately defines none of them, so write-side code cannot compile. */
++#define GU_PROFILE_NAME "PROBE-ONLY-ASUS-TUF-B550M-PLUS-WIFI-3636-RTX3070TI"
++#define GU_BOARD_ID 0x248210deU
++#define GU_BOARD_SUBSYSTEM 0x16213777U
++
+ #elif defined(GU_PROFILE_H610M_3060)
+ 
+ /* Gigabyte H610M H BIOS FC, Core i5-14400 (UHD 730 iGPU 8086:4682 enabled,
+@@ -244,6 +265,44 @@
+ #define GU_NVGOP_TEXT_BYTES 0x20d33U
+ #define GU_NVGOP_TEXT_SHA256 "615b37a708b1894e18d7fa60cfcdacaa4d8b598863a10b8103d231a595847b2b"
+ 
++#elif defined(GU_PROFILE_B550M_3070TI)
++
++/* ASUSTeK TUF GAMING B550M-PLUS (WI-FI) BIOS 3636, Ryzen 9 5900X (no
++ * integrated display controller at all), Colorful RTX 3070 Ti 8GB (GA104,
++ * VBIOS 94.04.5a.00.bb). Non-aggregate single-RTX console: ConOutDev is
++ * byte-identical to the target's own GOP path, so nvgop owns the console
++ * directly and GU_CONSOLE_AGGREGATE stays 0.
++ *
++ * Values come from two read-only probe captures. The target sits behind root
++ * port 00:03.1 on secondary bus 0x07 (0000:07:00.0), not 0000:01:00.0, and
++ * ships nvgop 6.10 (0x6000a) rather than the 6.16 (0x60010) on the B660M and
++ * H610M evidence machines, so that fingerprint is machine-specific too.
++ *
++ * UNREVIEWED: no write path has ever run on this machine. The console
++ * release, the ownership chain and the SS0 transaction are unvalidated. */
++#define GU_PROFILE_NAME "ASUS-TUF-GAMING-B550M-PLUS-WIFI-3636-RTX3070TI"
++#define GU_BOARD_ID 0x248210deU
++#define GU_BOARD_SUBSYSTEM 0x16217377U
++#define GU_BAR0_BASE 0xfb000000ULL
++#define GU_BAR0_END 0xfbffffffULL
++#define GU_DEVICE_MEMORY_SIZE 0x2000U
++#define GU_CHIP_ID 0xb74000a1U
++#define GU_PROM_SHA256 "85c502fd09d140bb9cba1f6fb541da838929f61039a9bc9f036b4d33612e6eb3"
++#define GU_ROOT_PORT_DEVICE 3U
++#define GU_ROOT_PORT_FUNCTION 1U
++/* The endpoint is 0000:07:00.0 (secondary bus of root port 00:03.1), not the
++ * 0000:01:00.0 every reviewed profile pins. */
++#define GU_TARGET_BUS 7U
++/* 36-byte display device path: ACPI root, PciRoot(0), Pci(3,1), Pci(0,0), ADR 0x80010340. */
++#define GU_RTX_PATH_BYTES \
++  2,1,12,0,0xd0,0x41,3,10,0,0,0,0,1,1,6,0,1,3,1,1,6,0,0,0,2,3,8,0,0x40,3,1,128,127,255,4,0
++/* nvgop-ga1xx 0x6000a shipped in vBIOS 94.04.5a.00.bb. */
++#define GU_NVGOP_VERSION 0x6000aU
++#define GU_NVGOP_IMAGE_SIZE 0x2be40U
++#define GU_NVGOP_STOP 0x698U
++#define GU_NVGOP_TEXT_BYTES 0x24426U
++#define GU_NVGOP_TEXT_SHA256 "8924ba488419e5d82b524d10e8dd63bfe886f077026fae1a9cc03e25b920b276"
++
+ #else
+ 
+ /* ASUSTeK TUF GAMING B650M-PLUS WIFI BIOS 3057, Ryzen (Raphael iGPU
+@@ -278,3 +337,11 @@
+ #define GU_NVGOP_TEXT_SHA256 "6aad26e6909c9791dd0caba92d6658e9dfd8009aee80676002bf24ce2ad24d08"
+ 
+ #endif
++
++/* Endpoint bus number of the target GPU. Every reviewed profile puts it at
++ * 0000:01:00.0, so the default stays 1; the B550M board exposes the card on
++ * bus 0x07 behind root port 00:03.1 and selects its own value above.
++ * Segment, device and function remain pinned at 0/0/0 for every profile. */
++#ifndef GU_TARGET_BUS
++#define GU_TARGET_BUS 1U
++#endif
+diff --git a/internal-boot/unlock/ownership.c b/internal-boot/unlock/ownership.c
+index 19a8f92..938fd8e 100644
+--- a/internal-boot/unlock/ownership.c
++++ b/internal-boot/unlock/ownership.c
+@@ -81,6 +81,24 @@ EFI_STATUS GuFindReleaseOwner(EFI_SYSTEM_TABLE *Table,GU_RELEASE_OWNER *Owner,BO
+        child relationships instead of assuming a route alone proves isolation. */
+     if(e->Attributes!=EFI_OPEN_PROTOCOL_BY_DRIVER || e->AgentHandle!=Owner->agent ||
+        e->ControllerHandle!=Gu.handle || e->OpenCount!=1) {
++#if defined(GU_PROFILE_B550M_3070TI)
++      /* One narrow exception, for this profile only. The nvgop driver installs
++       * a GOP child controller on the target and then opens DevicePath on the
++       * target BY_CHILD_CONTROLLER with that child as controller. The child
++       * belongs to the very driver being released, so DisconnectController
++       * tears down nothing foreign; record 5 of the capture is exactly this.
++       * Foreign agents, wrong open counts and any other non-BY_DRIVER open stay
++       * refused. This is what makes the target's own console GOP disappear,
++       * which the display policy already declares as expected. */
++      BOOLEAN ownChild=e->Attributes==EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER &&
++        e->AgentHandle==Owner->agent && e->OpenCount==1 &&
++        e->ControllerHandle && e->ControllerHandle!=Gu.handle;
++      if(ownChild) {
++        if(Log)GuLog("release accepted: record %u is the driver's own child controller %#llx\n",
++          (unsigned)i,(unsigned long long)(UINTN)e->ControllerHandle);
++        continue;
++      }
++#endif
+       if(Log)GuLog("release refused: active child, different owner or unsupported open at record %u\n",(unsigned)i);
+       return EFI_ACCESS_DENIED;
+     }
+diff --git a/internal-boot/unlock/port.c b/internal-boot/unlock/port.c
+index b01e1bf..c17670d 100644
+--- a/internal-boot/unlock/port.c
++++ b/internal-boot/unlock/port.c
+@@ -53,7 +53,7 @@ VOID GuInit(EFI_BOOT_SERVICES *Bs, EFI_PCI_IO_PROTOCOL *Pci) {
+ #endif
+ }
+ BOOLEAN GuTargetConfig(const UINT32 *C, UINTN S, UINTN B, UINTN D, UINTN F) {
+-  return C && !S && B==1 && !D && !F && C[0]==GU_BOARD_ID &&
++  return C && !S && B==GU_TARGET_BUS && !D && !F && C[0]==GU_BOARD_ID &&
+     C[11]==GU_BOARD_SUBSYSTEM && (C[2]>>24)==3 && !((C[3]>>16)&0x7f);
+ }
+ BOOLEAN GuSafeToReturn(VOID) {
+diff --git a/research/headless/observe-manifest.ps1 b/research/headless/observe-manifest.ps1
+index cf6310e..5409050 100644
+--- a/research/headless/observe-manifest.ps1
++++ b/research/headless/observe-manifest.ps1
+@@ -18,7 +18,8 @@ function Assert-ObservationManifest([string]$Repo,$Manifest,[string]$Mode,[strin
+  }
+  if($Manifest.UsbMedia -isnot [bool] -or !$Manifest.UsbMedia -or $Manifest.DumpsProm -isnot [bool]){throw 'Invalid observation USB/PROM flags'}
+  $profiles=@{'b650m-3090fe'=@();'b660m-3070ti'=@('-DGU_PROFILE_B660M_3070TI');'x870-3090ti'=@('-DGU_PROFILE_X870_3090TI');
+-  'b660plus-3060'=@('-DGU_PROFILE_B660PLUS_3060');'h610m-3060'=@('-DGU_PROFILE_H610M_3060');'probe-h610m-3060'=@('-DGU_PROFILE_PROBE_H610M_3060')}
++  'b660plus-3060'=@('-DGU_PROFILE_B660PLUS_3060');'h610m-3060'=@('-DGU_PROFILE_H610M_3060');'probe-h610m-3060'=@('-DGU_PROFILE_PROBE_H610M_3060');
++  'probe-b550m-3070ti'=@('-DGU_PROFILE_PROBE_B550M_3070TI')}
+  if($Manifest.HardwareProfile -isnot [string] -or @($profiles.Keys) -cnotcontains $Manifest.HardwareProfile){throw 'Unknown observation hardware profile'}
+  $defines=@($profiles[$Manifest.HardwareProfile])+@('-DGU_USB_MEDIA')
+  if($Manifest.DumpsProm){$defines+='-DGU_PROBE_DUMP_PROM'}
