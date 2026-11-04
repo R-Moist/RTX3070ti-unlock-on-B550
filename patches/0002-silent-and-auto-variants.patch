@@ -1,0 +1,264 @@
+# 0002 - silent and auto-arm release variants (B550M / RTX 3070 Ti port)
+#
+# Apply after 0001-support-asus-b550m-plus-wifi-rtx3070ti.patch on upstream f33a4c8.
+# Adds two compile-time switches, both driven by build.ps1:
+#   -Silent   -> -DGU_SILENT_LOCK -DGU_AUTO_ARM : no log file, no console echo,
+#                single "Unlocking" banner, no key prompt (release image).
+#   -AutoArm  -> -DGU_AUTO_ARM                 : every log line kept, still no key prompt.
+# Without either switch the original manual-U behaviour is unchanged.
+
+--- a/internal-boot/unlock/app.c
++++ b/internal-boot/unlock/app.c
+@@ -427,6 +427,19 @@
+   }
+   return GuLogReady() && Gu.profile_verified && Gu.owned && Gu.prom_verified && Gu.display_ok && !Gu.fault && !PendingOwner.agent?EFI_SUCCESS:EFI_ACCESS_DENIED;
+ #else
++#ifdef GU_AUTO_ARM
++  /* Auto-arm variant: the read-only preflight above is the entire gate, so one
++   * stock transaction is authorized without a key press and without a cancel
++   * window. The stall changes no decision; it only keeps this screen readable
++   * before the driver release blanks it (the log file has the full record). */
++  GuLog("EXPERIMENTAL AUTO UNLOCK: profile=%s exact RTX3070Ti / target-owned console / verified PROM and assets.\n",GU_STOCK_PROFILE_NAME);
++  if(PendingOwner.agent)GuLogText("The RTX firmware driver will be released automatically, access settings restored if needed, then every check re-run once.\n");
++  GuLogText("No key press, no cancel window: holding 2 s for this screen, then starting the single transaction.\n");
++  if(!GuLogReady())return EFI_DEVICE_ERROR;
++  if(!Gu.bs->Stall)return EFI_UNSUPPORTED;
++  GuStall(2000000);
++  return Gu.profile_verified && !Gu.fault?EFI_SUCCESS:EFI_ACCESS_DENIED;
++#else
+   if(!Table->ConIn || !Table->ConIn->Reset || !Table->ConIn->ReadKeyStroke)return EFI_UNSUPPORTED;
+   EFI_STATUS status=Table->ConIn->Reset(Table->ConIn,FALSE);if(EFI_ERROR(status))return status;
+   GuLog("EXPERIMENTAL MANUAL UNLOCK: profile=%s exact RTX3090 24GB / AMD display / verified PROM and assets.\n",GU_STOCK_PROFILE_NAME);
+@@ -444,6 +457,7 @@
+   return EFI_TIMEOUT;
+ #endif
+ #endif
++#endif
+ }
+ static VOID Halt(VOID) {
+   Gu.retained=TRUE;
+@@ -540,6 +554,17 @@
+   return Gu.bs->StartImage(image,NULL,NULL);
+ }
+ #endif
++#ifdef GU_SILENT_LOCK
++/* Silent variant: the one and only thing this image prints. Drawn once the image
++ * is allowed to run (after the Secure Boot gate, before any hardware preflight),
++ * so the operator sees the tool is alive; it stays on the framebuffer afterwards
++ * because the console GOP is released with the target driver and nothing
++ * repaints the screen before Windows takes over. */
++static VOID GuBanner(VOID) {
++  if(Table && Table->ConOut && Table->ConOut->OutputString)
++    (void)Table->ConOut->OutputString(Table->ConOut,L"Unlocking\r\n");
++}
++#endif
+ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+   if(!St || !St->BootServices || !St->RuntimeServices)return EFI_INVALID_PARAMETER;
+   Table=St;GuInit(St->BootServices,NULL);Gu.image=Image;Gu.display_check=DisplayCheck;
+@@ -552,12 +577,19 @@
+ #if defined(GU_AUTOMATIC_BOOT)
+   GuLog("BUILD MODE: AUTOMATIC INTERNAL UNLOCK; profile=%s; Esc cancellation; all hardware gates retained.\n",GU_STOCK_PROFILE_NAME);
+ #elif defined(GU_EXPERIMENTAL_3090)
++#ifdef GU_AUTO_ARM
++  GuLog("BUILD MODE: EXPERIMENTAL AUTO DEBUG UNLOCK; compile-time profile=%s. Exact-card checks authorize one stock transaction with no key press; every console line is also appended to RUNxx\\REPORT.TXT.\n",GU_STOCK_PROFILE_NAME);
++#else
+   GuLog("BUILD MODE: EXPERIMENTAL MANUAL UNLOCK; compile-time profile=%s. The shared I/O preflight banner above is superseded: exact-card checks and manual U can authorize one stock transaction.\n",GU_STOCK_PROFILE_NAME);
+ #endif
++#endif
+   UINT8 secure=0xff;UINTN bytes=1;
+   Stage="secure-boot";
+   status=St->RuntimeServices->GetVariable(L"SecureBoot",&GlobalGuid,NULL,&bytes,&secure);
+   if(EFI_ERROR(status) || bytes!=1 || secure){status=EFI_SECURITY_VIOLATION;goto finish;}
++#ifdef GU_SILENT_LOCK
++  GuBanner();
++#endif
+   status=Step(status);if(EFI_ERROR(status))goto finish;
+   Stage="watchdog";status=Step(Gu.bs->SetWatchdogTimer(0,0,0,NULL));if(EFI_ERROR(status))goto finish;
+   Stage="target";status=Step(FindTarget());if(EFI_ERROR(status))goto finish;
+@@ -575,7 +607,11 @@
+ #ifndef GU_AUTOMATIC_BOOT
+   if(status==EFI_ACCESS_DENIED) {
+     status=GuFindReleaseOwner(St,&PendingOwner,TRUE);
++#ifdef GU_AUTO_ARM
++    if(!EFI_ERROR(status))GuLogText("Exclusive ownership deferred until the automatic driver release.\n");
++#else
+     if(!EFI_ERROR(status))GuLogText("Exclusive ownership deferred until manual U and explicit driver release.\n");
++#endif
+   }
+ #endif
+   status=Step(status);if(EFI_ERROR(status))goto finish;
+@@ -591,7 +627,11 @@
+   if(PendingOwner.agent) {
+     GU_RELEASE_OWNER current;
+     Stage="owner-recheck";
++#ifdef GU_AUTO_ARM
++    GuLogText("Auto-armed: release RTX firmware driver once, then revalidate.\n");
++#else
+     GuLogText("Manual U confirmed: release RTX firmware driver once, then revalidate.\n");
++#endif
+     if(!GuLogReady()){status=EFI_DEVICE_ERROR;goto finish;}
+     /* Durable intent precedes the last owner snapshot. No file IO between a
+        successful final comparison and DisconnectController. */
+--- a/internal-boot/unlock/app_io.c
++++ b/internal-boot/unlock/app_io.c
+@@ -11,8 +11,11 @@
+ static EFI_GUID LoadedGuid=EFI_LOADED_IMAGE_PROTOCOL_GUID,PathGuid=EFI_DEVICE_PATH_PROTOCOL_GUID,
+   FsGuid=EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,InfoGuid=EFI_FILE_INFO_ID;
+ static EFI_SYSTEM_TABLE *Table;
+-static EFI_FILE_PROTOCOL *Root,*Parent,*Run,*Report;
++static EFI_FILE_PROTOCOL *Root,*Parent;
++#ifndef GU_SILENT_LOCK
++static EFI_FILE_PROTOCOL *Run,*Report;
+ static BOOLEAN LogFault;
++#endif
+ #ifdef GU_HEADLESS_RESEARCH
+ /* Convert warnings at every file/protocol boundary, before consuming outputs. */
+ static BOOLEAN GuIoError(EFI_STATUS s){return s!=EFI_SUCCESS;}
+@@ -27,6 +30,18 @@
+  {"gpu-unlock/610.43.03/gsp_boot_ga102.bin",L"ASSETS\\gsp_boot_ga102.bin",24576,"3df651acb174fd5f5561a1996965b192f50c5d763168446ed0d4ead19d895768"},
+  {"gpu-unlock/610.43.03/gsp_boot_desc_ga102.bin",L"ASSETS\\gsp_boot_desc_ga102.bin",84,"cc5a3fc1f4c47f2fe107b1b68f0176d8a448e6dec84b575e5560ccef5262bf15"}
+ };
++#ifdef GU_SILENT_LOCK
++/* Silent variant: this image writes no files at all and prints exactly one word
++ * (the banner in app.c). Every transactional code path still calls these
++ * helpers, so turning the sink into a no-op keeps the control flow and every
++ * hardware gate identical while the ESP is left untouched: no RUNxx directory,
++ * no REPORT.TXT, no console echo. A no-op sink can never fail, so GuLogReady()
++ * is a constant TRUE and no gate that depended on log liveness can trip. */
++VOID GuConsole(const char *Text){(void)Text;}
++VOID GuLogText(const char *Text){(void)Text;}
++VOID GuLog(const char *Format,...){(void)Format;}
++BOOLEAN GuLogReady(VOID){return TRUE;}
++#else
+ static VOID LogError(VOID){LogFault=TRUE;if(Gu.armed)Gu.fault=TRUE;}
+ VOID GuConsole(const char *Text) {
+ #ifdef GU_HEADLESS_RESEARCH
+@@ -56,6 +71,7 @@
+   GuLogText(text);
+ }
+ BOOLEAN GuLogReady(VOID){return Report && !LogFault;}
++#endif
+ static BOOLEAN UsbPath(EFI_HANDLE Handle) {
+   EFI_DEVICE_PATH_PROTOCOL *path=NULL;
+   if(EFI_ERROR(Table->BootServices->HandleProtocol(Handle,&PathGuid,(VOID **)&path)) || !path)return FALSE;
+@@ -91,19 +107,28 @@
+   return EFI_SUCCESS;
+ }
+ EFI_STATUS GuIoOpen(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+-  Table=St;Root=Parent=Run=Report=NULL;LogFault=FALSE;memset(GuAssets,0,sizeof(GuAssets));
++  Table=St;Root=Parent=NULL;
++  memset(GuAssets,0,sizeof(GuAssets));
++#ifndef GU_SILENT_LOCK
++  Run=Report=NULL;LogFault=FALSE;
++#endif
+   EFI_LOADED_IMAGE_PROTOCOL *loaded=NULL;EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs=NULL;
+   EFI_STATUS status=Table->BootServices->HandleProtocol(Image,&LoadedGuid,(VOID **)&loaded);
+   if(EFI_ERROR(status) || !loaded || !UsbPath(loaded->DeviceHandle))return EFI_UNSUPPORTED;
+   status=Table->BootServices->HandleProtocol(loaded->DeviceHandle,&FsGuid,(VOID **)&fs);
+   if(EFI_ERROR(status) || !fs)return EFI_UNSUPPORTED;
+   status=fs->OpenVolume(fs,&Root);if(EFI_ERROR(status) || !Root)return EFI_DEVICE_ERROR;
++#if defined(GU_SILENT_LOCK)
++#define GU_PARENT_MODE EFI_FILE_MODE_READ
++#else
++#define GU_PARENT_MODE (EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE)
++#endif
+ #if defined(GU_EXPERIMENTAL_3090)
+-  status=Root->Open(Root,&Parent,L"\\RTX3090-UNLOCK",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
++  status=Root->Open(Root,&Parent,L"\\RTX3090-UNLOCK",GU_PARENT_MODE,0);
+ #else
+-  status=Root->Open(Root,&Parent,L"\\RTX3090-PREFLIGHT",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
++  status=Root->Open(Root,&Parent,L"\\RTX3090-PREFLIGHT",GU_PARENT_MODE,0);
+ #endif
+-#if defined(GU_PROFILE_B550M_3070TI)
++#if defined(GU_PROFILE_B550M_3070TI) && !defined(GU_SILENT_LOCK)
+   /* Shell/anywhere operation: if the volume has no output directory yet, create
+    * it rather than exiting silently. Without this a fresh stick or a Shell
+    * invocation fails before a single log line exists, which is indistinguishable
+@@ -121,6 +146,12 @@
+ #endif
+   if(EFI_ERROR(status) || !Parent){Parent=NULL;return EFI_NOT_FOUND;}
+   status=Metadata(Parent,TRUE,0);if(EFI_ERROR(status))return status;
++#ifdef GU_SILENT_LOCK
++  /* Read-only variant: the directory only has to exist, because ASSETS is read
++   * through this handle later. No RUNxx slot is claimed and no REPORT.TXT is
++   * created, so nothing on the volume is modified. */
++  return EFI_SUCCESS;
++#else
+ #ifdef GU_AUTOMATIC_BOOT
+   for(UINTN slot=0;slot<1000000;slot++) {
+     CHAR16 name[]=L"AUTO000000";UINTN number=slot;
+@@ -149,13 +180,18 @@
+ #endif
+     GuLog("RTX3090 AUTOMATIC INTERNAL UNLOCK\nAUTO%06u\nEsc cancels; exact hardware gates and one transaction only.\n",(unsigned)slot);
+ #elif defined(GU_EXPERIMENTAL_3090)
++#ifdef GU_AUTO_ARM
++    GuLog("RTX3090 AMD EXPERIMENTAL AUTO DEBUG UNLOCK\nRUN%02u\nNo key press, no cancel window; one hardware transaction. Hardware success unverified.\n",(unsigned)slot);
++#else
+     GuLog("RTX3090 AMD EXPERIMENTAL MANUAL UNLOCK\nRUN%02u\nManual U starts one hardware transaction; Esc or timeout cancels. Hardware success unverified.\n",(unsigned)slot);
++#endif
+ #else
+     GuLog("RTX3090 AMD read-only cold-state preflight\nRUN%02u\nCannot arm: GPU writes, DMA, reset and driver release are blocked.\n",(unsigned)slot);
+ #endif
+     return GuLogReady()?EFI_SUCCESS:EFI_DEVICE_ERROR;
+   }
+   return EFI_VOLUME_FULL;
++#endif
+ }
+ EFI_STATUS GuLoadAssets(VOID) {
+   for(UINTN i=0;i<5;i++) {
+@@ -186,9 +222,16 @@
+   for(UINTN i=0;i<5;i++){GuFree((VOID *)GuAssets[i].firmware.data);memset(&GuAssets[i],0,sizeof(GuAssets[i]));}
+ }
+ EFI_STATUS GuIoClose(VOID) {
+-  EFI_FILE_PROTOCOL **files[]={&Report,&Run,&Parent,&Root};EFI_STATUS result=EFI_SUCCESS;
++#ifdef GU_SILENT_LOCK
++  EFI_FILE_PROTOCOL **files[]={&Parent,&Root};
++  const UINTN file_count=2;
++#else
++  EFI_FILE_PROTOCOL **files[]={&Report,&Run,&Parent,&Root};
++  const UINTN file_count=4;
++#endif
++  EFI_STATUS result=EFI_SUCCESS;
+   if(!GuSafeToReturn())return EFI_ACCESS_DENIED;
+-  for(UINTN i=0;i<4;i++)if(*files[i]) {
++  for(UINTN i=0;i<file_count;i++)if(*files[i]) {
+     /* EFI_FILE_PROTOCOL.Close invalidates the handle even on error. */
+     EFI_FILE_PROTOCOL *file=*files[i];*files[i]=NULL;
+     EFI_STATUS status=file->Close(file);
+--- a/internal-boot/unlock/build.ps1
++++ b/internal-boot/unlock/build.ps1
+@@ -8,6 +8,8 @@
+  [switch]$AutomaticBoot,
+  [switch]$HeadlessResearch,
+  [switch]$UsbMedia,
++ [switch]$Silent,
++ [switch]$AutoArm,
+  [ValidateSet('original03100062','observed03000062','entryLatchedSs1Preserve','entryLatchedSs1Full')][string]$StockProfile,
+  [ValidateSet('b650m-3090fe','b660m-3070ti','x870-3090ti','b660plus-3060','h610m-3060','b550m-3070ti','local')][string]$HardwareProfile='b650m-3090fe'
+ )
+@@ -35,7 +37,14 @@
+  if(!$ExperimentalUnlock -and $PSBoundParameters.ContainsKey('StockProfile')){throw '-StockProfile is only valid with -ExperimentalUnlock'}
+  $out=if($ExperimentalUnlock){"build/experimental/$StockProfile"}else{'build'}
+  $name=if($ExperimentalUnlock){"RTX3090-EXPERIMENTAL-$StockProfile"}else{'RTX3090-PREFLIGHT'}
++ # Release variants: -Silent is the no-log image (one "Unlocking" banner), -AutoArm
++ # keeps every log line but drops the U prompt. Both imply automatic arming.
++ if($Silent){$out+='/silent';$name+='-SILENT'}
++ elseif($AutoArm){$out+='/autoarm';$name+='-AUTOARM'}
+  $defines=@()
++ if(($Silent -or $AutoArm) -and !$ExperimentalUnlock){throw '-Silent and -AutoArm only make sense on an -ExperimentalUnlock (write-capable) build'}
++ if($Silent){$defines+='-DGU_SILENT_LOCK'}
++ if($Silent -or $AutoArm){$defines+='-DGU_AUTO_ARM'}
+  if($HeadlessResearch -and (!$AutomaticBoot -or !$InternalBoot -or !$ExperimentalUnlock -or $StockProfile -ne 'entryLatchedSs1Full')){throw 'Headless research requires automatic internal exact full profile'}
+  if($hw.HeadlessOnly -and $ExperimentalUnlock -and !$HeadlessResearch){throw ('Profile '+$HardwareProfile+' only ships a headless write path; non-headless builds are diagnostic-only')}
+  if($hw.UsbOnly -and $ExperimentalUnlock -and !$UsbMedia){throw ('Profile '+$HardwareProfile+' only ships the headless USB write path')}
+@@ -64,8 +73,8 @@
+  & $Python verify_pe.py "$out/$name.EFI" "$out/$name.map" --output "$out/pe-verification.json"
+  if($LASTEXITCODE -ne 0){throw 'PE verification failed'}
+  $manifest=[ordered]@{BuiltUtc=[DateTime]::UtcNow.ToString('o');HardwareProfile=$hw.Name;TargetPci=$hw.TargetPci;Subsystem=$hw.Subsystem;
+-  Mode=$(if($HeadlessResearch){'headless-research-automatic-internal-exact-card-unlock'}elseif($AutomaticBoot){'automatic-internal-exact-card-unlock'}elseif($ExperimentalUnlock){'experimental-exact-card-manual-unlock'}else{'diagnostic-preflight-only'});
+-  CanArm=[bool]$ExperimentalUnlock;Defines=$defines;ManualConfirmation=$(if($AutomaticBoot){'none; Esc within 3 seconds cancels'}else{'U once; Esc or 30-second timeout cancels'});
++  Mode=$(if($HeadlessResearch){'headless-research-automatic-internal-exact-card-unlock'}elseif($AutomaticBoot){'automatic-internal-exact-card-unlock'}elseif($Silent){'experimental-exact-card-silent-auto-unlock'}elseif($AutoArm){'experimental-exact-card-auto-debug-unlock'}elseif($ExperimentalUnlock){'experimental-exact-card-manual-unlock'}else{'diagnostic-preflight-only'});
++  CanArm=[bool]$ExperimentalUnlock;Defines=$defines;ManualConfirmation=$(if($AutomaticBoot){'none; Esc within 3 seconds cancels'}elseif($Silent -or $AutoArm){'none; arms automatically once the read-only preflight passes'}else{'U once; Esc or 30-second timeout cancels'});
+   StockProfile=$(if($ExperimentalUnlock){$StockProfile}else{$null});ColdChipExpected=$hw.Chip;ColdSS0Expected=$(if($StockProfile -like 'entryLatchedSs1*'){'first fully validated cold entry; immutable'}elseif($ExperimentalUnlock){if($StockProfile -eq 'original03100062'){'0x03100062'}else{'0x03000062'}}else{'unknown'});ColdSS1Expected=$(if($StockProfile -like 'entryLatchedSs1*'){'first fully validated cold entry <= 0xf; immutable'}else{'0x6'});
+   SS0Target='0x88888888';SS1Target=$(if($StockProfile -eq 'entryLatchedSs1Preserve'){'preserve entry; no SS1 writes'}elseif($StockProfile -eq 'entryLatchedSs1Full'){'0x8; one guarded write'}elseif($ExperimentalUnlock){'0x8'}else{'no writes'});
+   OriginalBaselineCapture='G:/RTX3090-PREFLIGHT/RUN00/REPORT.TXT';
